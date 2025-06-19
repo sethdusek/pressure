@@ -1,0 +1,17 @@
+[package]
+name = "pressure"
+version = "0.1.0"
+edition = "2024"
+
+[features]
+tokio = ["dep:tokio"]
+default = ["tokio"]
+
+[dependencies]
+base64 = "0.22.1"
+nix = { version = "0.30.1", features = ["poll"] }
+tokio = { version = "1.45.1", optional = true, features = [
+    "net",
+    "macros",
+    "rt",
+] }
