@@ -1,63 +1,128 @@
+//! Pressure monitoring library, using Pressure Stall Information (PSI) On Linux.
+//! # Example:
+//! ```
+//! use pressure::PressureMonitor;
+//! fn main() {
+//!     let mut monitor = PressureMonitor::new().unwrap();
+//!     std::thread::spawn(move || {
+//!         loop {
+//!             monitor.wait().unwrap();
+//!             // Code to handle pressure event, for example by calling malloc_trim(), or dropping caches
+//!         }
+//!     });
+//! }
+//! ```
 #[cfg(not(target_os = "linux"))]
 compile_error!("pressure is only supported on Linux-based operating systems");
 
 use std::{
-    fs::OpenOptions,
+    env::VarError,
     io::Write,
     os::{
         fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd},
-        unix::fs::{FileTypeExt, OpenOptionsExt},
+        unix::net::UnixStream,
     },
 };
 
 use base64::Engine;
 use nix::{
-    libc::O_NONBLOCK,
+    errno::Errno,
+    libc::{S_IFIFO, S_IFMT, S_IFREG, S_IFSOCK},
     poll::{PollFd, PollFlags, PollTimeout},
 };
-use tokio::io::Interest;
+use thiserror::Error;
 
+#[derive(Error, Debug)]
+pub enum Error {
+    #[error("nix error: {0}")]
+    Nix(#[from] nix::Error),
+    #[error("io error: {0}")]
+    Io(#[from] std::io::Error),
+    #[error("{0}")]
+    VarError(#[from] VarError),
+    #[error("expected regular file, fifo or socket, got something else")]
+    UnexpectedFileType,
+}
+
+/// Represents a pressure monitor that can be used to wait for memory pressure events
 pub struct PressureMonitor {
     pressure_file: MonitorType,
 }
 
 impl PressureMonitor {
-    pub fn new() -> Self {
-        let pressure_file = init_monitor();
-        Self { pressure_file }
+    pub fn new() -> Result<Self, Error> {
+        let pressure_file = init_monitor()?;
+        Ok(Self { pressure_file })
     }
-    pub fn wait(&mut self) {
-        match &self.pressure_file {
-            MonitorType::File(owned_fd) => {
-                nix::poll::poll(
-                    &mut [PollFd::new(owned_fd.as_fd(), PollFlags::POLLPRI)],
-                    PollTimeout::NONE,
-                )
-                .unwrap();
-            }
-            MonitorType::Fifo(owned_fd) | MonitorType::Socket(owned_fd) => {}
-        }
+    /// Wait for a single pressure event to occur.
+    /// It is safe to call this function in a busy loop, as even if memory pressure persists the kernel limits the amount of events sent
+    pub fn wait(&mut self) -> Result<(), Error> {
+        let (pollflag, needs_read) = match &self.pressure_file {
+            MonitorType::File(_) => (PollFlags::POLLPRI, false),
+            MonitorType::Fifo(_) | MonitorType::Socket(_) => (PollFlags::POLLIN, true),
+        };
         nix::poll::poll(
-            &mut [PollFd::new(self.pressure_file.as_fd(), PollFlags::POLLPRI)],
+            &mut [PollFd::new(self.pressure_file.as_fd(), pollflag)],
             PollTimeout::NONE,
         )
         .unwrap();
+        if needs_read {
+            let mut buf = [0; 1024];
+            match nix::unistd::read(self.pressure_file.as_fd(), &mut buf) {
+                Ok(_) => {}
+                Err(Errno::EWOULDBLOCK) => {}
+                Err(e) => Err(e)?,
+            }
+        }
+        Ok(())
     }
-    // #[cfg(feature = "tokio")]
-    // pub async fn wait_async(&mut self) {
-    //     tokio::io::unix::AsyncFd::with_interest(
-    //         self.pressure_file.try_clone().unwrap(),
-    //         Interest::PRIORITY,
-    //     )
-    //     .unwrap()
-    //     .ready(Interest::PRIORITY)
-    //     .await
-    //     .unwrap()
-    //     .clear_ready();
-    // }
 }
 
-enum MonitorType {
+#[cfg(feature = "tokio")]
+pub mod tokio {
+    //! Asynchronous pressure monitoring using Tokio's event loop
+    use std::os::fd::AsFd;
+
+    use nix::errno::Errno;
+    use tokio::io::{Interest, unix::AsyncFd};
+
+    use crate::{Error, MonitorType, init_monitor};
+
+    /// Asynchronous equivalent to [PressureMonitor](`super::PressureMonitor`)
+    pub struct PressureMonitor {
+        pressure_file: AsyncFd<MonitorType>,
+    }
+
+    impl PressureMonitor {
+        pub fn new() -> Result<Self, Error> {
+            let pressure_file = init_monitor()?;
+            Ok(Self {
+                pressure_file: AsyncFd::new(pressure_file)?,
+            })
+        }
+
+        /// Wait for a single pressure event to occur.
+        /// It is safe to call this function in a busy loop, as even if memory pressure persists the kernel limits the amount of events sent
+        pub async fn wait(&mut self) -> Result<(), Error> {
+            let (pollflag, needs_read) = match self.pressure_file.get_ref() {
+                MonitorType::File(_) => (Interest::PRIORITY, false),
+                MonitorType::Fifo(_) | MonitorType::Socket(_) => (Interest::READABLE, true),
+            };
+            self.pressure_file.ready(pollflag).await?.clear_ready();
+            if needs_read {
+                let mut buf = [0; 512];
+                match nix::unistd::read(self.pressure_file.get_ref().as_fd(), &mut buf) {
+                    Ok(_) => {}
+                    Err(Errno::EWOULDBLOCK) => {}
+                    Err(e) => Err(e)?,
+                }
+            }
+            Ok(())
+        }
+    }
+}
+
+pub(crate) enum MonitorType {
     File(OwnedFd),
     Fifo(OwnedFd),
     Socket(OwnedFd),
@@ -83,32 +148,67 @@ impl AsRawFd for MonitorType {
     }
 }
 
-fn init_monitor() -> MonitorType {
-    let source =
-        std::env::var("MEMORY_PRESSURE_WATCH").unwrap_or_else(|_| "/proc/pressure/memory".into());
-    let mut pressure_file = OpenOptions::new()
-        .custom_flags(O_NONBLOCK)
-        .write(true)
-        .open(source)
-        .unwrap();
-    match std::env::var("MEMORY_PRESSURE_WRITE") {
-        Ok(var) => pressure_file
-            .write_all(&base64::prelude::BASE64_STANDARD.decode(&var).unwrap())
-            .unwrap(),
-        Err(std::env::VarError::NotPresent) => {
-            pressure_file.write_all(b"some 20000 2000000\x00").unwrap()
+const DEFAULT_PRESSURE: &[u8; 19] = b"some 20000 2000000\x00";
+
+fn is_regular_file(stat: &nix::sys::stat::FileStat) -> bool {
+    (stat.st_mode & S_IFMT) == S_IFREG
+}
+
+fn is_socket(stat: &nix::sys::stat::FileStat) -> bool {
+    (stat.st_mode & S_IFMT) == S_IFSOCK
+}
+
+fn is_fifo(stat: &nix::sys::stat::FileStat) -> bool {
+    (stat.st_mode & S_IFMT) == S_IFIFO
+}
+
+fn init_monitor() -> Result<MonitorType, Error> {
+    let source = std::env::var("MEMORY_PRESSURE_WATCH");
+    let (path, write) = match source.as_deref() {
+        // Systemd sets MEMORY_PRESSURE_WATCH to /dev/null to indicate memory pressure monitoring is disabled for this service/unit
+        // Instead of disabling memory pressure handling entirely we instead default to /proc/pressure/memory
+        Ok("/dev/null") | Err(VarError::NotPresent) => {
+            ("/proc/pressure/memory".into(), DEFAULT_PRESSURE.into())
         }
-        Err(e) => Err(e).unwrap(),
-    }
-    let file_type = pressure_file.metadata().unwrap().file_type();
-    let pressure_fd: OwnedFd = pressure_file.into();
-    if file_type.is_file() {
-        MonitorType::File(pressure_fd)
-    } else if file_type.is_fifo() {
-        MonitorType::Fifo(pressure_fd)
-    } else if file_type.is_socket() {
-        MonitorType::Socket(pressure_fd)
+        Ok(path) => match std::env::var("MEMORY_PRESSURE_WRITE") {
+            Ok(write) => {
+                let write = base64::prelude::BASE64_STANDARD.decode(&write).unwrap();
+                (path, write)
+            }
+            Err(_) => (path, Vec::new()),
+        },
+        Err(e) => Err(e.clone())?,
+    };
+
+    let fd = nix::fcntl::open(
+        &path[..],
+        nix::fcntl::OFlag::O_PATH | nix::fcntl::OFlag::O_CLOEXEC,
+        nix::sys::stat::Mode::empty(),
+    )?;
+
+    let stat = nix::sys::stat::fstat(fd)?;
+
+    if is_regular_file(&stat) || is_fifo(&stat) {
+        let fd = nix::fcntl::open(
+            &path[..],
+            nix::fcntl::OFlag::O_RDWR
+                | nix::fcntl::OFlag::O_CLOEXEC
+                | nix::fcntl::OFlag::O_NONBLOCK,
+            nix::sys::stat::Mode::empty(),
+        )?;
+        nix::unistd::write(&fd, &write)?;
+        if is_regular_file(&stat) {
+            Ok(MonitorType::File(fd))
+        } else {
+            Ok(MonitorType::Fifo(fd))
+        }
+    } else if is_socket(&stat) {
+        let mut stream = UnixStream::connect(&path[..])?;
+        stream.set_nonblocking(true)?;
+        stream.write_all(&write)?;
+        let fd: OwnedFd = stream.into();
+        Ok(MonitorType::Socket(fd))
     } else {
-        todo!();
+        Err(Error::UnexpectedFileType)
     }
 }
