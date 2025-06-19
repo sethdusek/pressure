@@ -20,14 +20,13 @@ use std::{
     io::Write,
     os::{
         fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd},
-        unix::net::UnixStream,
+        unix::{fs::FileTypeExt, net::UnixStream},
     },
 };
 
 use base64::Engine;
 use nix::{
     errno::Errno,
-    libc::{S_IFIFO, S_IFMT, S_IFREG, S_IFSOCK},
     poll::{PollFd, PollFlags, PollTimeout},
 };
 use thiserror::Error;
@@ -150,18 +149,6 @@ impl AsRawFd for MonitorType {
 
 const DEFAULT_PRESSURE: &[u8; 19] = b"some 20000 2000000\x00";
 
-fn is_regular_file(stat: &nix::sys::stat::FileStat) -> bool {
-    (stat.st_mode & S_IFMT) == S_IFREG
-}
-
-fn is_socket(stat: &nix::sys::stat::FileStat) -> bool {
-    (stat.st_mode & S_IFMT) == S_IFSOCK
-}
-
-fn is_fifo(stat: &nix::sys::stat::FileStat) -> bool {
-    (stat.st_mode & S_IFMT) == S_IFIFO
-}
-
 fn init_monitor() -> Result<MonitorType, Error> {
     let source = std::env::var("MEMORY_PRESSURE_WATCH");
     let (path, write) = match source.as_deref() {
@@ -180,15 +167,9 @@ fn init_monitor() -> Result<MonitorType, Error> {
         Err(e) => Err(e.clone())?,
     };
 
-    let fd = nix::fcntl::open(
-        &path[..],
-        nix::fcntl::OFlag::O_PATH | nix::fcntl::OFlag::O_CLOEXEC,
-        nix::sys::stat::Mode::empty(),
-    )?;
+    let file_type = std::fs::metadata(&path)?.file_type();
 
-    let stat = nix::sys::stat::fstat(fd)?;
-
-    if is_regular_file(&stat) || is_fifo(&stat) {
+    if file_type.is_file() || file_type.is_fifo() {
         let fd = nix::fcntl::open(
             &path[..],
             nix::fcntl::OFlag::O_RDWR
@@ -197,12 +178,12 @@ fn init_monitor() -> Result<MonitorType, Error> {
             nix::sys::stat::Mode::empty(),
         )?;
         nix::unistd::write(&fd, &write)?;
-        if is_regular_file(&stat) {
+        if file_type.is_file() {
             Ok(MonitorType::File(fd))
         } else {
             Ok(MonitorType::Fifo(fd))
         }
-    } else if is_socket(&stat) {
+    } else if file_type.is_socket() {
         let mut stream = UnixStream::connect(&path[..])?;
         stream.set_nonblocking(true)?;
         stream.write_all(&write)?;
